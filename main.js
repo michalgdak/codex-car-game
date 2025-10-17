@@ -1,0 +1,996 @@
+(() => {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const overlay = document.getElementById('overlay');
+
+    const BASE_WIDTH = 1280;
+    const BASE_HEIGHT = 720;
+
+    function resizeCanvas() {
+        const aspect = BASE_WIDTH / BASE_HEIGHT;
+        let w = window.innerWidth;
+        let h = window.innerHeight;
+        if (w / h > aspect) {
+            w = h * aspect;
+        } else {
+            h = w / aspect;
+        }
+        canvas.style.width = w + 'px';
+        canvas.style.height = h + 'px';
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // Utility vector helpers -------------------------------------------------
+    function vec(x = 0, y = 0) { return { x, y }; }
+    function add(a, b) { return { x: a.x + b.x, y: a.y + b.y }; }
+    function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y }; }
+    function mul(a, s) { return { x: a.x * s, y: a.y * s }; }
+    function dot(a, b) { return a.x * b.x + a.y * b.y; }
+    function length(v) { return Math.hypot(v.x, v.y); }
+    function normalize(v) {
+        const len = length(v);
+        if (!len) return { x: 0, y: 0 };
+        return { x: v.x / len, y: v.y / len };
+    }
+    function lerp(a, b, t) { return a + (b - a) * t; }
+
+    function catmullRom(p0, p1, p2, p3, t) {
+        const t2 = t * t;
+        const t3 = t2 * t;
+        return {
+            x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2*p0.x - 5*p1.x + 4*p2.x - p3.x) * t2 + (-p0.x + 3*p1.x - 3*p2.x + p3.x) * t3),
+            y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2*p0.y - 5*p1.y + 4*p2.y - p3.y) * t2 + (-p0.y + 3*p1.y - 3*p2.y + p3.y) * t3)
+        };
+    }
+
+    function catmullRomTangent(p0, p1, p2, p3, t) {
+        const t2 = t * t;
+        return {
+            x: 0.5 * ((-p0.x + p2.x) + 2*(2*p0.x - 5*p1.x + 4*p2.x - p3.x) * t + 3*(-p0.x + 3*p1.x - 3*p2.x + p3.x) * t2),
+            y: 0.5 * ((-p0.y + p2.y) + 2*(2*p0.y - 5*p1.y + 4*p2.y - p3.y) * t + 3*(-p0.y + 3*p1.y - 3*p2.y + p3.y) * t2)
+        };
+    }
+
+    function getPolygonBounds(points) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of points) {
+            if (p.x < minX) minX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y > maxY) maxY = p.y;
+        }
+        return { minX, minY, maxX, maxY };
+    }
+
+    // Track generation -------------------------------------------------------
+    function generateTrack() {
+        const marginX = 60;
+        const marginY = 60;
+        const usableWidth = BASE_WIDTH - marginX * 2;
+        const usableHeight = BASE_HEIGHT - marginY * 2;
+        const normalized = [
+            { x: 0.18, y: 0.80 },
+            { x: 0.34, y: 0.92 },
+            { x: 0.60, y: 0.94 },
+            { x: 0.80, y: 0.86 },
+            { x: 0.90, y: 0.70 },
+            { x: 0.94, y: 0.52 },
+            { x: 0.88, y: 0.32 },
+            { x: 0.74, y: 0.18 },
+            { x: 0.56, y: 0.12 },
+            { x: 0.38, y: 0.14 },
+            { x: 0.22, y: 0.22 },
+            { x: 0.12, y: 0.38 },
+            { x: 0.12, y: 0.56 },
+            { x: 0.24, y: 0.70 },
+            { x: 0.42, y: 0.78 },
+            { x: 0.62, y: 0.78 },
+            { x: 0.76, y: 0.68 },
+            { x: 0.82, y: 0.54 },
+            { x: 0.74, y: 0.40 },
+            { x: 0.58, y: 0.34 },
+            { x: 0.40, y: 0.34 },
+            { x: 0.28, y: 0.46 },
+            { x: 0.24, y: 0.62 }
+        ];
+        const normBounds = getPolygonBounds(normalized);
+        const width = normBounds.maxX - normBounds.minX;
+        const height = normBounds.maxY - normBounds.minY;
+        const scale = Math.min(usableWidth / width, usableHeight / height);
+        const offsetX = marginX + (usableWidth - width * scale) * 0.5;
+        const offsetY = marginY + (usableHeight - height * scale) * 0.5;
+
+        const controlPoints = normalized.map(p => ({
+            x: offsetX + (p.x - normBounds.minX) * scale,
+            y: offsetY + (p.y - normBounds.minY) * scale
+        }));
+
+        const samples = [];
+        const tangents = [];
+        const density = 24;
+        for (let i = 0; i < controlPoints.length; i++) {
+            const p0 = controlPoints[(i - 1 + controlPoints.length) % controlPoints.length];
+            const p1 = controlPoints[i];
+            const p2 = controlPoints[(i + 1) % controlPoints.length];
+            const p3 = controlPoints[(i + 2) % controlPoints.length];
+            for (let j = 0; j < density; j++) {
+                const t = j / density;
+                const pos = catmullRom(p0, p1, p2, p3, t);
+                const tan = catmullRomTangent(p0, p1, p2, p3, t);
+                samples.push(pos);
+                tangents.push(normalize(tan));
+            }
+        }
+
+        const halfWidth = 100;
+        const leftEdge = [];
+        const rightEdge = [];
+        const normals = [];
+        for (let i = 0; i < samples.length; i++) {
+            const tangent = tangents[i];
+            const normal = { x: -tangent.y, y: tangent.x };
+            normals.push(normal);
+            leftEdge.push(add(samples[i], mul(normal, halfWidth)));
+            rightEdge.push(add(samples[i], mul(normal, -halfWidth)));
+        }
+
+        // Precompute segment lengths for centerline lookup table
+        const cumulative = [0];
+        let lengthSum = 0;
+        for (let i = 0; i < samples.length; i++) {
+            const a = samples[i];
+            const b = samples[(i + 1) % samples.length];
+            const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+            lengthSum += segLen;
+            cumulative.push(lengthSum);
+        }
+
+        // Start line defined by first center sample normals
+        const start = samples[0];
+        const startNormal = normals[0];
+        const startLeft = add(start, mul(startNormal, halfWidth * 1.1));
+        const startRight = add(start, mul(startNormal, -halfWidth * 1.1));
+        const startDir = tangents[0];
+
+        const bounds = getPolygonBounds(leftEdge.concat(rightEdge));
+        const mapScale = 0.18;
+        const map = {
+            bounds,
+            scale: mapScale,
+            offset: {
+                x: BASE_WIDTH - (bounds.maxX - bounds.minX) * mapScale - 40,
+                y: 40
+            }
+        };
+
+        // Place item boxes along the track by distance
+        const itemBoxes = [];
+        const boxCount = 6;
+        for (let i = 0; i < boxCount; i++) {
+            const targetS = (lengthSum / boxCount) * i + lengthSum / (boxCount * 2);
+            const { position, normal } = getPointAtDistance(samples, cumulative, targetS % lengthSum);
+            const lateral = (i % 2 === 0 ? 1 : -1) * halfWidth * 0.4;
+            const world = add(position, mul(normal, lateral));
+            itemBoxes.push({ position: world, radius: 24, cooldown: 0, respawnDelay: 4, available: true });
+        }
+
+        return {
+            controlPoints,
+            samples,
+            tangents,
+            normals,
+            leftEdge,
+            rightEdge,
+            halfWidth,
+            cumulative,
+            length: lengthSum,
+            startLine: { left: startLeft, right: startRight, normal: startNormal, direction: startDir },
+            map,
+            itemBoxes
+        };
+    }
+
+    function getPointAtDistance(samples, cumulative, target) {
+        const total = cumulative[cumulative.length - 1];
+        let dist = target;
+        if (dist < 0) dist += total;
+        if (dist >= total) dist -= total;
+        let low = 0, high = cumulative.length - 1;
+        while (low < high) {
+            const mid = Math.floor((low + high) / 2);
+            if (cumulative[mid] <= dist) low = mid + 1; else high = mid;
+        }
+        const idx = Math.max(0, low - 1);
+        const segLen = cumulative[idx + 1] - cumulative[idx];
+        const t = segLen ? (dist - cumulative[idx]) / segLen : 0;
+        const a = samples[idx];
+        const b = samples[(idx + 1) % samples.length];
+        const tangent = normalize({ x: b.x - a.x, y: b.y - a.y });
+        const normal = { x: -tangent.y, y: tangent.x };
+        return {
+            position: { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t },
+            tangent,
+            normal,
+            index: idx,
+            t,
+            distance: dist
+        };
+    }
+
+    function projectPointToTrack(track, point) {
+        const { samples } = track;
+        let bestDist = Infinity;
+        let best = null;
+        for (let i = 0; i < samples.length; i++) {
+            const a = samples[i];
+            const b = samples[(i + 1) % samples.length];
+            const ab = sub(b, a);
+            const ap = sub(point, a);
+            const abLen2 = dot(ab, ab);
+            let t = abLen2 === 0 ? 0 : Math.max(0, Math.min(1, dot(ap, ab) / abLen2));
+            const proj = { x: a.x + ab.x * t, y: a.y + ab.y * t };
+            const diff = sub(point, proj);
+            const dist2 = dot(diff, diff);
+            if (dist2 < bestDist) {
+                bestDist = dist2;
+                const segLen = Math.sqrt(abLen2);
+                const tangent = segLen ? { x: ab.x / segLen, y: ab.y / segLen } : { x: 1, y: 0 };
+                const normal = { x: -tangent.y, y: tangent.x };
+                const baseDistance = track.cumulative[i] + t * segLen;
+                best = {
+                    position: proj,
+                    tangent,
+                    normal,
+                    distance: baseDistance % track.length,
+                    lateral: dot(diff, normal),
+                    index: i,
+                    t
+                };
+            }
+        }
+        return best;
+    }
+
+    // Game state -------------------------------------------------------------
+    const keys = new Map();
+    window.addEventListener('keydown', (e) => {
+        if (e.repeat) return;
+        keys.set(e.code, true);
+        if (state === GAME_STATES.TITLE) {
+            const p1Keys = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ']);
+            const p2Keys = new Set(['ArrowLeft', 'ArrowRight', 'ShiftRight', 'Enter']);
+            if (p1Keys.has(e.code)) {
+                selectedPlayers = 1;
+                menuIndex = 0;
+                setupTitleScreen();
+            } else if (p2Keys.has(e.code)) {
+                selectedPlayers = 2;
+                menuIndex = 1;
+                setupTitleScreen();
+            }
+        }
+    });
+    window.addEventListener('keyup', (e) => {
+        keys.set(e.code, false);
+    });
+
+    const TOTAL_LAPS = 3;
+    const GAME_STATES = { TITLE: 'title', COUNTDOWN: 'countdown', RUN: 'run', PAUSE: 'pause', FINISH: 'finish' };
+    let state = GAME_STATES.TITLE;
+    let countdownTimer = 0;
+    let countdownValue = 3;
+    let track = generateTrack();
+    let cars = [];
+    let hazards = [];
+    let mute = false;
+    let lastTimestamp = 0;
+
+    const WEAPON_TYPES = ['banana', 'oil'];
+
+    const playerConfigs = [
+        {
+            color: '#ffdd55',
+            controls: { accel: 'KeyW', brake: 'KeyS', left: 'KeyA', right: 'KeyD', item: 'KeyQ' },
+            label: 'P1'
+        },
+        {
+            color: '#55aaff',
+            controls: { accel: 'ArrowUp', brake: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', item: 'ShiftRight', altItem: 'Enter' },
+            label: 'P2'
+        }
+    ];
+
+    let selectedPlayers = 1;
+    let menuIndex = 0;
+
+    function setupTitleScreen() {
+        overlay.innerHTML = '';
+        const wrap = document.createElement('div');
+        wrap.className = 'title-screen';
+        wrap.innerHTML = `
+            <h1>Vector Velocity</h1>
+            <div class="option ${menuIndex === 0 ? 'selected' : ''}" data-val="1">1 PLAYER</div>
+            <div class="option ${menuIndex === 1 ? 'selected' : ''}" data-val="2">2 PLAYERS</div>
+            <div class="prompt">Press ENTER to start</div>
+            <div class="prompt">Controls: WASD/Q and Arrow Keys/Shift</div>
+        `;
+        overlay.appendChild(wrap);
+    }
+
+    function setupFinishScreen(winnerText) {
+        overlay.innerHTML = '';
+        const wrap = document.createElement('div');
+        wrap.className = 'finish-screen';
+        wrap.innerHTML = `
+            <h1>${winnerText}</h1>
+            <div class="prompt">Press R to race again</div>
+            <div class="prompt">Press ESC to return to title</div>
+        `;
+        overlay.appendChild(wrap);
+    }
+
+    setupTitleScreen();
+
+    function createCar(config, startOffset, id) {
+        const spawn = getPointAtDistance(track.samples, track.cumulative, startOffset);
+        const forward = spawn.tangent;
+        const pos = add(spawn.position, mul(spawn.normal, 18));
+        return {
+            config,
+            id,
+            position: pos,
+            angle: Math.atan2(forward.y, forward.x),
+            velocity: vec(),
+            width: 22,
+            length: 38,
+            traction: 1,
+            slip: { type: null, timer: 0 },
+            oilTimer: 0,
+            item: null,
+            itemCooldown: 0,
+            lap: 1,
+            lapsCompleted: 0,
+            progressDistance: spawn.distance,
+            totalProgress: spawn.distance,
+            lapTimes: [],
+            bestLap: null,
+            lastLap: null,
+            lastProgressDistance: spawn.distance,
+            speed: 0,
+            label: config.label,
+            eliminated: false,
+            startOffset
+        };
+    }
+
+    function resetRace(playerCount) {
+        track = generateTrack();
+        hazards = [];
+        const spacing = 30;
+        cars = [];
+        for (let i = 0; i < playerCount; i++) {
+            const offset = (track.length - i * spacing + track.length) % track.length;
+            cars.push(createCar(playerConfigs[i], offset, i));
+        }
+        countdownValue = 3;
+        countdownTimer = 0;
+        state = GAME_STATES.COUNTDOWN;
+        overlay.innerHTML = '';
+    }
+
+    function applyHazardToCar(car, hazard) {
+        if (hazard.type === 'banana') {
+            car.slip.type = 'banana';
+            car.slip.timer = 1.1;
+            car.oilTimer = 0;
+            car.velocity = mul(car.velocity, 0.5);
+        } else if (hazard.type === 'oil') {
+            car.oilTimer = 2.2;
+            car.velocity = mul(car.velocity, 0.85);
+        }
+    }
+
+    function spawnHazard(car, type) {
+        const forward = { x: Math.cos(car.angle), y: Math.sin(car.angle) };
+        const dropPos = sub(car.position, mul(forward, car.length * 0.6));
+        hazards.push({
+            type,
+            position: { x: dropPos.x, y: dropPos.y },
+            radius: type === 'banana' ? 18 : 26,
+            timer: type === 'banana' ? 14 : 11,
+            rotation: Math.random() * Math.PI * 2,
+            ownerId: car.id,
+            grace: 0.45
+        });
+    }
+
+    function updateCar(car, dt) {
+        if (car.eliminated) return;
+        const controls = car.config.controls;
+        const accel = keys.get(controls.accel) ? 1 : 0;
+        const brake = keys.get(controls.brake) ? 1 : 0;
+        const left = keys.get(controls.left) ? 1 : 0;
+        const right = keys.get(controls.right) ? 1 : 0;
+        const itemKey = keys.get(controls.item) || (controls.altItem ? keys.get(controls.altItem) : false);
+
+        const forward = { x: Math.cos(car.angle), y: Math.sin(car.angle) };
+        const lateralDir = { x: -forward.y, y: forward.x };
+
+        const maxSpeed = 420;
+        const accelForce = 520;
+        const brakeForce = 620;
+        const baseFriction = 0.98;
+        const rolling = 0.995;
+
+        let traction = car.oilTimer > 0 ? 0.35 : 1;
+        if (car.slip.type === 'banana') {
+            traction *= 0.2;
+        }
+
+        const projection = projectPointToTrack(track, car.position);
+        const onTrack = Math.abs(projection.lateral) <= track.halfWidth * 0.98;
+        const onGrass = Math.abs(projection.lateral) > track.halfWidth * 0.6;
+        if (!onTrack) {
+            traction *= 0.2;
+        } else if (onGrass) {
+            traction *= 0.55;
+        }
+
+        // Input acceleration
+        const throttleForce = accel * accelForce - brake * brakeForce * (car.speed > 0 ? 0.7 : 0.5);
+        const driving = mul(forward, throttleForce * dt);
+        car.velocity = add(car.velocity, driving);
+
+        // Natural drag
+        car.velocity = mul(car.velocity, Math.pow(rolling, dt * 60));
+
+        // Lateral friction for traction
+        const velForward = dot(car.velocity, forward);
+        const velLateral = dot(car.velocity, lateralDir);
+        const lateralDamping = 1 - Math.min(1, traction * 10 * dt);
+        const newLateral = velLateral * lateralDamping;
+        car.velocity = add(mul(forward, velForward), mul(lateralDir, newLateral));
+
+        // Base friction to slow down overall
+        car.velocity = mul(car.velocity, Math.pow(baseFriction, dt * 60));
+
+        // Cap speed
+        const speedMag = length(car.velocity);
+        if (speedMag > maxSpeed) {
+            car.velocity = mul(car.velocity, maxSpeed / speedMag);
+        }
+        car.speed = length(car.velocity);
+
+        // Steering
+        const steerInput = right - left;
+        let steerStrength = 0;
+        if (car.speed > 10) {
+            steerStrength = (steerInput) * 2.4 * dt * (0.7 + Math.min(1, car.speed / maxSpeed));
+        } else if (steerInput !== 0) {
+            steerStrength = steerInput * 1.4 * dt;
+        }
+        if (car.oilTimer > 0) {
+            steerStrength *= 0.6;
+        }
+        if (car.slip.type === 'banana') {
+            steerStrength += (Math.random() - 0.5) * dt * 6;
+        }
+        car.angle += steerStrength;
+
+        // Banana spin effect rotates velocity
+        if (car.slip.type === 'banana') {
+            const spin = 4.2 * dt;
+            const cos = Math.cos(spin);
+            const sin = Math.sin(spin);
+            car.velocity = {
+                x: car.velocity.x * cos - car.velocity.y * sin,
+                y: car.velocity.x * sin + car.velocity.y * cos
+            };
+        }
+
+        car.position = add(car.position, mul(car.velocity, dt));
+
+        // Item usage
+        if (car.item && car.itemCooldown <= 0 && itemKey) {
+            spawnHazard(car, car.item);
+            car.item = null;
+            car.itemCooldown = 1.2;
+        }
+        if (car.itemCooldown > 0) car.itemCooldown = Math.max(0, car.itemCooldown - dt);
+        if (car.oilTimer > 0) car.oilTimer = Math.max(0, car.oilTimer - dt);
+        if (car.slip.timer > 0) {
+            car.slip.timer -= dt;
+            if (car.slip.timer <= 0) car.slip.type = null;
+        }
+
+        // Collision with track bounds
+        resolveTrackCollision(car, projection);
+
+        updateProgress(car, projection);
+
+        // Check item pickups
+        for (const box of track.itemBoxes) {
+            if (!box.available) continue;
+            const dist = Math.hypot(car.position.x - box.position.x, car.position.y - box.position.y);
+            if (dist < box.radius + Math.max(car.width, car.length) * 0.4) {
+                if (!car.item) {
+                    car.item = WEAPON_TYPES[Math.floor(Math.random() * WEAPON_TYPES.length)];
+                    box.available = false;
+                    box.cooldown = box.respawnDelay;
+                }
+            }
+        }
+
+        // Check hazards
+        for (const hazard of hazards) {
+            if (hazard.ownerId === car.id && hazard.grace > 0) continue;
+            const hitRadius = hazard.radius + Math.max(car.width, car.length) * 0.35;
+            const dist = Math.hypot(car.position.x - hazard.position.x, car.position.y - hazard.position.y);
+            if (dist < hitRadius) {
+                applyHazardToCar(car, hazard);
+                hazard.timer = 0; // remove next update
+            }
+        }
+    }
+
+    function resolveTrackCollision(car, projection) {
+        const closest = projection || projectPointToTrack(track, car.position);
+        const allowed = track.halfWidth - Math.max(car.width, car.length) * 0.25;
+        const lateral = closest.lateral;
+        if (Math.abs(lateral) > allowed) {
+            const normal = lateral > 0 ? closest.normal : { x: -closest.normal.x, y: -closest.normal.y };
+            const penetration = Math.abs(lateral) - allowed;
+            car.position = add(car.position, mul(normal, -penetration));
+            const vn = dot(car.velocity, normal);
+            if (vn > 0) {
+                car.velocity = add(car.velocity, mul(normal, -vn * 1.6));
+            }
+            car.velocity = mul(car.velocity, 0.7);
+        }
+    }
+
+    function updateProgress(car, projection) {
+        const closest = projectPointToTrack(track, car.position);
+        let dist = closest.distance;
+        const prev = car.lastProgressDistance;
+        let delta = dist - prev;
+        if (delta < -track.length / 2) {
+            delta += track.length;
+        } else if (delta > track.length / 2) {
+            delta -= track.length;
+        }
+        car.totalProgress += delta;
+        car.lastProgressDistance = dist;
+
+        const lapNumber = Math.floor(car.totalProgress / track.length) + 1;
+        if (lapNumber > car.lap) {
+            const nowLap = lapNumber - 1;
+            const lapTime = raceClock - (car.lapStartTime || 0);
+            if (nowLap > 0) {
+                car.lastLap = lapTime;
+                if (car.bestLap === null || lapTime < car.bestLap) {
+                    car.bestLap = lapTime;
+                }
+                car.lapTimes.push(lapTime);
+            }
+            car.lapStartTime = raceClock;
+            car.lap = lapNumber;
+            car.lapsCompleted = lapNumber - 1;
+            if (car.lapsCompleted >= TOTAL_LAPS) {
+                car.lapsCompleted = TOTAL_LAPS;
+                car.finished = true;
+                car.finishTime = raceClock;
+            }
+        }
+    }
+
+    function updateHazards(dt) {
+        hazards = hazards.filter(h => {
+            h.timer -= dt;
+            if (h.grace > 0) h.grace = Math.max(0, h.grace - dt);
+            return h.timer > 0;
+        });
+    }
+
+    function updateItemBoxes(dt) {
+        for (const box of track.itemBoxes) {
+            if (!box.available) {
+                box.cooldown -= dt;
+                if (box.cooldown <= 0) {
+                    box.available = true;
+                }
+            }
+        }
+    }
+
+    let raceClock = 0;
+
+    function update(dt) {
+        if (state === GAME_STATES.COUNTDOWN) {
+            countdownTimer += dt;
+            if (countdownTimer >= 1) {
+                countdownTimer = 0;
+                countdownValue--;
+                if (countdownValue <= 0) {
+                    state = GAME_STATES.RUN;
+                    raceClock = 0;
+                    for (const car of cars) {
+                        car.lapStartTime = 0;
+                    }
+                }
+            }
+        }
+
+        if (state === GAME_STATES.RUN) {
+            raceClock += dt;
+            updateHazards(dt);
+            updateItemBoxes(dt);
+            for (const car of cars) {
+                updateCar(car, dt);
+            }
+            hazards = hazards.filter(h => h.timer > 0);
+            const finished = cars.filter(c => c.finished).length;
+            if (finished === cars.length) {
+                state = GAME_STATES.FINISH;
+                const sorted = [...cars].sort((a, b) => a.finishTime - b.finishTime);
+                const winner = sorted[0];
+                setupFinishScreen(`${winner.label} Wins!`);
+            }
+        }
+    }
+
+    function drawTrack() {
+        ctx.fillStyle = '#1b5e20';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Track ribbon
+        ctx.beginPath();
+        track.leftEdge.forEach((p, i) => {
+            if (!i) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        });
+        for (let i = track.rightEdge.length - 1; i >= 0; i--) {
+            const p = track.rightEdge[i];
+            ctx.lineTo(p.x, p.y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = '#424242';
+        ctx.fill();
+
+        // Curbs
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = '#d32f2f';
+        ctx.beginPath();
+        track.leftEdge.forEach((p, i) => {
+            if (!i) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.stroke();
+
+        ctx.strokeStyle = '#f9a825';
+        ctx.beginPath();
+        track.rightEdge.forEach((p, i) => {
+            if (!i) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.stroke();
+
+        // Draw center dashed line
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([12, 18]);
+        ctx.beginPath();
+        track.samples.forEach((p, i) => {
+            if (!i) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Start line
+        const sl = track.startLine;
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 8;
+        ctx.beginPath();
+        ctx.moveTo(sl.left.x, sl.left.y);
+        ctx.lineTo(sl.right.x, sl.right.y);
+        ctx.stroke();
+
+        // Item boxes
+        for (const box of track.itemBoxes) {
+            ctx.save();
+            ctx.translate(box.position.x, box.position.y);
+            ctx.rotate(Math.PI / 4);
+            ctx.fillStyle = box.available ? '#ffb74d' : 'rgba(180,180,180,0.4)';
+            ctx.fillRect(-14, -14, 28, 28);
+            ctx.strokeStyle = '#4e342e';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(-14, -14, 28, 28);
+            ctx.restore();
+        }
+    }
+
+    function drawCars() {
+        for (const car of cars) {
+            ctx.save();
+            ctx.translate(car.position.x, car.position.y);
+            ctx.rotate(car.angle);
+            ctx.fillStyle = car.config.color;
+            ctx.fillRect(-car.length * 0.5, -car.width * 0.5, car.length, car.width);
+            ctx.fillStyle = 'rgba(255,255,255,0.7)';
+            ctx.fillRect(car.length * 0.15, -car.width * 0.3, car.length * 0.35, car.width * 0.6);
+            ctx.restore();
+
+            // Label
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px monospace';
+            ctx.fillText(car.label, car.position.x - 14, car.position.y - car.width - 10);
+        }
+    }
+
+    function drawHazards() {
+        for (const hazard of hazards) {
+            ctx.save();
+            ctx.translate(hazard.position.x, hazard.position.y);
+            ctx.rotate(hazard.rotation);
+            if (hazard.type === 'banana') {
+                ctx.fillStyle = '#ffeb3b';
+                ctx.beginPath();
+                ctx.moveTo(-6, 10);
+                ctx.lineTo(6, 10);
+                ctx.lineTo(0, -12);
+                ctx.closePath();
+                ctx.fill();
+            } else {
+                ctx.fillStyle = 'rgba(30,30,30,0.85)';
+                ctx.beginPath();
+                ctx.ellipse(0, 0, 18, 12, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.restore();
+        }
+    }
+
+    function drawHUD() {
+        if (!cars.length) return;
+        const panelWidth = 320;
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(16, 16, panelWidth, 120 + cars.length * 36);
+        ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+        ctx.strokeRect(16, 16, panelWidth, 120 + cars.length * 36);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '18px monospace';
+        ctx.fillText(`Lap: ${Math.min(TOTAL_LAPS, cars[0].lap)}/${TOTAL_LAPS}`, 28, 42);
+        ctx.fillText(`Time: ${formatTime(raceClock)}`, 28, 68);
+
+        const standings = [...cars].sort((a, b) => {
+            if (a.lapsCompleted !== b.lapsCompleted) {
+                return b.lapsCompleted - a.lapsCompleted;
+            }
+            return b.totalProgress - a.totalProgress;
+        });
+        const positionMap = new Map();
+        standings.forEach((car, idx) => positionMap.set(car, idx + 1));
+
+        ctx.font = '14px monospace';
+        for (let i = 0; i < cars.length; i++) {
+            const car = cars[i];
+            const y = 104 + i * 32;
+            ctx.fillStyle = car.config.color;
+            const pos = positionMap.get(car);
+            ctx.fillText(`${car.label}  #${pos}/${cars.length}`, 28, y);
+            ctx.fillStyle = '#fff';
+            const speedUnits = car.speed * 0.62;
+            const lastLap = car.lastLap ? formatTime(car.lastLap) : '--:--';
+            const bestLap = car.bestLap ? formatTime(car.bestLap) : '--:--';
+            ctx.fillText(`SPD ${speedUnits.toFixed(0)}`, 168, y);
+            ctx.fillText(`Last ${lastLap}`, 228, y);
+            ctx.fillText(`Best ${bestLap}`, 228, y + 16);
+        }
+
+        // Item display for P1
+        const p1 = cars[0];
+        if (p1) {
+            ctx.fillStyle = 'rgba(0,0,0,0.45)';
+            ctx.fillRect(16, canvas.height - 100, 130, 68);
+            ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+            ctx.strokeRect(16, canvas.height - 100, 130, 68);
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px monospace';
+            ctx.fillText('ITEM', 30, canvas.height - 80);
+            drawItemIcon(p1.item, 80, canvas.height - 66);
+            if (p1.itemCooldown > 0) {
+                ctx.fillStyle = '#ffab91';
+                ctx.fillText(`CD ${(p1.itemCooldown).toFixed(1)}s`, 30, canvas.height - 48);
+            }
+        }
+        const p2 = cars[1];
+        if (p2) {
+            ctx.fillStyle = 'rgba(0,0,0,0.45)';
+            ctx.fillRect(canvas.width - 146, canvas.height - 100, 130, 68);
+            ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+            ctx.strokeRect(canvas.width - 146, canvas.height - 100, 130, 68);
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px monospace';
+            ctx.fillText('ITEM', canvas.width - 132, canvas.height - 80);
+            drawItemIcon(p2.item, canvas.width - 72, canvas.height - 66);
+            if (p2.itemCooldown > 0) {
+                ctx.fillStyle = '#ffab91';
+                ctx.fillText(`CD ${(p2.itemCooldown).toFixed(1)}s`, canvas.width - 132, canvas.height - 48);
+            }
+        }
+
+        // Countdown display
+        if (state === GAME_STATES.COUNTDOWN) {
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#fff';
+            ctx.font = '72px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(countdownValue > 0 ? countdownValue : 'GO!', canvas.width / 2, canvas.height / 2);
+            ctx.textAlign = 'left';
+        }
+
+        // Mini-map
+        drawMinimap();
+    }
+
+    function drawItemIcon(item, x, y) {
+        ctx.save();
+        ctx.translate(x, y);
+        if (!item) {
+            ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+            ctx.strokeRect(-20, -20, 40, 40);
+            ctx.restore();
+            return;
+        }
+        if (item === 'banana') {
+            ctx.fillStyle = '#ffd600';
+            ctx.beginPath();
+            ctx.moveTo(-12, 12);
+            ctx.lineTo(12, 12);
+            ctx.lineTo(0, -14);
+            ctx.closePath();
+            ctx.fill();
+        } else if (item === 'oil') {
+            ctx.fillStyle = '#212121';
+            ctx.beginPath();
+            ctx.ellipse(0, 4, 14, 10, 0, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.restore();
+    }
+
+    function drawMinimap() {
+        const { bounds, scale, offset } = track.map;
+        const mapWidth = (bounds.maxX - bounds.minX) * scale;
+        const mapHeight = (bounds.maxY - bounds.minY) * scale;
+        ctx.save();
+        ctx.translate(offset.x, offset.y);
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(-20, -20, mapWidth + 40, mapHeight + 40);
+        ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+        ctx.strokeRect(-20, -20, mapWidth + 40, mapHeight + 40);
+        ctx.translate(20, 20);
+        ctx.scale(scale, scale);
+        ctx.translate(-bounds.minX, -bounds.minY);
+
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 10;
+        ctx.beginPath();
+        track.leftEdge.forEach((p, i) => {
+            if (!i) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.stroke();
+
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#000';
+        ctx.beginPath();
+        track.rightEdge.forEach((p, i) => {
+            if (!i) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.stroke();
+
+        for (const car of cars) {
+            ctx.fillStyle = car.config.color;
+            ctx.beginPath();
+            ctx.arc(car.position.x, car.position.y, 12, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.restore();
+    }
+
+    function formatTime(time) {
+        if (time === undefined || time === null) return '--:--';
+        const minutes = Math.floor(time / 60);
+        const seconds = time % 60;
+        return `${minutes}:${seconds.toFixed(2).padStart(5, '0')}`;
+    }
+
+    function draw() {
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawTrack();
+        drawHazards();
+        drawCars();
+        drawHUD();
+        ctx.restore();
+    }
+
+    function handleInput(dt) {
+        if (state === GAME_STATES.TITLE) {
+            if (keys.get('ArrowUp')) {
+                menuIndex = (menuIndex - 1 + 2) % 2;
+                selectedPlayers = menuIndex + 1;
+                setupTitleScreen();
+                keys.set('ArrowUp', false);
+            }
+            if (keys.get('ArrowDown')) {
+                menuIndex = (menuIndex + 1) % 2;
+                selectedPlayers = menuIndex + 1;
+                setupTitleScreen();
+                keys.set('ArrowDown', false);
+            }
+            if (keys.get('Enter')) {
+                resetRace(selectedPlayers);
+                keys.set('Enter', false);
+            }
+        } else if (state === GAME_STATES.RUN || state === GAME_STATES.COUNTDOWN) {
+            if (keys.get('Escape')) {
+                state = GAME_STATES.PAUSE;
+                overlay.innerHTML = '<div class="finish-screen"><h1>Paused</h1><div class="prompt">Press ESC to resume</div><div class="prompt">Press R to restart</div></div>';
+                keys.set('Escape', false);
+            }
+        } else if (state === GAME_STATES.PAUSE) {
+            if (keys.get('Escape')) {
+                overlay.innerHTML = '';
+                state = GAME_STATES.RUN;
+                keys.set('Escape', false);
+            }
+            if (keys.get('KeyR')) {
+                resetRace(cars.length || selectedPlayers);
+                keys.set('KeyR', false);
+            }
+            if (keys.get('KeyM')) {
+                mute = !mute;
+                keys.set('KeyM', false);
+            }
+        } else if (state === GAME_STATES.FINISH) {
+            if (keys.get('KeyR')) {
+                resetRace(cars.length || selectedPlayers);
+                keys.set('KeyR', false);
+            }
+            if (keys.get('Escape')) {
+                state = GAME_STATES.TITLE;
+                menuIndex = selectedPlayers - 1;
+                setupTitleScreen();
+                keys.set('Escape', false);
+            }
+        }
+
+        if (keys.get('KeyR') && state !== GAME_STATES.TITLE && state !== GAME_STATES.COUNTDOWN) {
+            resetRace(cars.length || selectedPlayers);
+            keys.set('KeyR', false);
+        }
+        if (keys.get('KeyM')) {
+            mute = !mute;
+            keys.set('KeyM', false);
+        }
+    }
+
+    function loop(timestamp) {
+        const dt = Math.min(0.033, (timestamp - lastTimestamp) / 1000 || 0.016);
+        lastTimestamp = timestamp;
+        handleInput(dt);
+        if (state !== GAME_STATES.TITLE && state !== GAME_STATES.PAUSE && state !== GAME_STATES.FINISH) {
+            update(dt);
+        }
+        draw();
+        requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+})();
